@@ -180,6 +180,10 @@ def ipAddr(s):
   except socket.error: pass
   raise ValueError(s)
 
+# Check if ipv6.
+def isIpv6(s):
+  return "." not in s
+
 # If no section has been specified, list all sections available.
 def listSections():
   query = 'SELECT id, name, description FROM sections ORDER BY id ASC'
@@ -321,6 +325,7 @@ try:
 
       ip = ipAddr(row[2])
       ip_real = ip
+      isipv6 = isIpv6(ip_real)
 
       state = row[3]
 
@@ -386,16 +391,20 @@ try:
           if mac:
             entry = entry + '{}{};\n'.format(comment, '        hardware ethernet ' + mac)
           if ip:
-            entry = entry + '{}{};\n'.format(comment, '        fixed-address ' + ip_real)
+            param = 'fixed-address6' if isipv6 else 'fixed-address'
+            entry = entry + '{}{};\n'.format(comment, '        ' + param + ' ' + ip_real)
           if args.ddns:
             entry = entry + '{}{};\n'.format(comment, '        ddns-hostname "' + host + '"')
-          if args.split_hostname:
+          if args.split_hostname and not isipv6:
               hostname = host.partition('.')[0]
               domain = host.partition('.')[2]
               entry = entry + '{}{};\n'.format(comment, '        option host-name "' + hostname + '"')
               entry = entry + '{}{};\n'.format(comment, '        option domain-name "' + domain + '"')
           else:
-              entry = entry + '{}{};\n'.format(comment, '        option host-name "' + host + '"')
+              if isipv6 :
+                  entry = entry + '{}{};\n'.format(comment, '        option dhcp6.fqdn "' + host + '"')
+              else:
+                  entry = entry + '{}{};\n'.format(comment, '        option host-name "' + host + '"')
           entry = entry + '{}}}\n\n'.format(comment)
           output = output + entry
 
