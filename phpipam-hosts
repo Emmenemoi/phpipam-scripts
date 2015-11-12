@@ -171,8 +171,14 @@ def ethernetAddr(s):
 
 # Convert IP address from its numerical value stored in the database.
 def ipAddr(s):
-  return socket.inet_ntoa(struct.pack('!L', int(s)))
-
+  try:
+      return socket.inet_ntop(socket.AF_INET, struct.pack('!L', int(s)) )
+  except struct.error: pass
+  try:
+      return socket.inet_ntop(socket.AF_INET6, struct.pack('!QQ', int(s) >> 64, int(s) & 18446744073709551615 ) )
+  except struct.error: pass
+  except socket.error: pass
+  raise ValueError(s)
 
 # If no section has been specified, list all sections available.
 def listSections():
