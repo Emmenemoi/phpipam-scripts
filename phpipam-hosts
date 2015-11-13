@@ -61,6 +61,7 @@ arg_parser.add_argument('-X','--restart-trigger', default=False, action='store_t
 
 # Add Dynamic DNS options in generated host lists
 arg_parser.add_argument('-y','--ddns', default=False, action='store_true', help='include Dynamic DNS options')
+arg_parser.add_argument('-Y','--ddns-domain', type=str, default=None, help='domain name to be used as base update domain.')
 
 # Generate host lists only with hosts that have errors (currently only bad MAC
 # addresses are considered as errors)
@@ -98,6 +99,9 @@ if config.has_section(args.group):
 
   if args.ddns is False and config.has_option(args.group,'ddns'):
     args.ddns = config.getboolean(args.group,'ddns')
+
+  if args.ddns_domain is None and config.has_option(args.group,'ddns-domain'):
+    args.ddns_domain = config.get(args.group,'ddns-domain')
 
   if args.split_hostname is False and config.has_option(args.group,'split-hostname'):
     args.split_hostname = config.getboolean(args.group,'split-hostname')
@@ -388,16 +392,26 @@ try:
 
         if args.format == 'dhcpd':
           entry = '{}host {} {{\n'.format(comment, host_identifier)
+          hostname = host.partition('.')[0]
+          domain = host.partition('.')[2]
           if mac:
             entry = entry + '{}{};\n'.format(comment, '        hardware ethernet ' + mac)
           if ip:
             param = 'fixed-address6' if isipv6 else 'fixed-address'
             entry = entry + '{}{};\n'.format(comment, '        ' + param + ' ' + ip_real)
           if args.ddns:
-            entry = entry + '{}{};\n'.format(comment, '        ddns-hostname "' + host + '"')
+            if args.split_hostname :
+                if args.ddns_domain :
+                    ddnshostname = host.partition("."+args.ddns_domain)[0]
+                    ddnsdomain = args.ddns_domain
+                else:
+                    ddnshostname = hostname
+                    ddnsdomain = domain
+                entry = entry + '{}{};\n'.format(comment, '        ddns-hostname "' + ddnshostname + '"')
+                entry = entry + '{}{};\n'.format(comment, '        ddns-domainname "' + ddnsdomain + '."')
+            else:
+                entry = entry + '{}{};\n'.format(comment, '        ddns-hostname "' + host + '"')
           if args.split_hostname and not isipv6:
-              hostname = host.partition('.')[0]
-              domain = host.partition('.')[2]
               entry = entry + '{}{};\n'.format(comment, '        option host-name "' + hostname + '"')
               entry = entry + '{}{};\n'.format(comment, '        option domain-name "' + domain + '"')
           else:
