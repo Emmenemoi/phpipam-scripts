@@ -1,0 +1,424 @@
+#!/usr/bin/env python
+
+import os, sys, re, argparse, MySQLdb, string, socket, struct, ConfigParser, filecmp
+import socket
+from binascii import hexlify
+
+# Define script version
+script_version = 'v0.0.1'
+
+# Parse command line arguments and define defaults
+arg_parser = argparse.ArgumentParser(
+    prog='phpipam-rev',
+    description='Generate reverse hosts zone from phpIPAM database',
+    epilog='%(prog)s Copyright (C) 2015 Sebastien Fuchs <sebastien@emmene-moi.fr>\nLicense: GPLv3.')
+
+# Default confguration file
+arg_parser.add_argument('-c','--config', type=file, default='/etc/dhcp/phpipam.conf', metavar='CONFIG', help='use alternative configuration file')
+
+# Default configuration section to use by default
+arg_parser.add_argument('-g','--group', type=str, default='hosts', help='configuration section to use (default: hosts)')
+
+# By default script will create empty files to avoid problems with missing
+# includes in dhcpd and dnsmasq
+arg_parser.add_argument('-m','--no-empty', default=True, action='store_false', help='do not create empty files')
+
+# Optional output file. If one is configured in the configuration options, you
+# can set '-o -' to output to stdout
+arg_parser.add_argument('-o','--output', type=str, metavar='FILE', help='output host list to a file')
+
+# Default shell command to execute to restart dhcpd daemon
+arg_parser.add_argument('-r','--restart-command', type=str, default='/etc/init.d/isc-dhcp-server restart', metavar='COMMAND', help='use alternative shell command to restart dhcpd')
+
+# Optional trigger file which can be used to indicate that the generated host
+# file has changed
+arg_parser.add_argument('-t','--trigger', type=str, metavar='FILE', help='create trigger file if host file has changed')
+
+# If this option is enabled, script will restart dhcpd daemon using specified
+# shell command
+arg_parser.add_argument('-x','--restart', default=False, action='store_true', help='restart dhcpd if host file changed')
+
+# When this option is enabled, script will check if a trigger file exists. If
+# it's found, script will restart dhcpd daemon and remove the trigger file.
+# Regardless of trigger file status, script will then exit without generating
+# any host lists
+arg_parser.add_argument('-X','--restart-trigger', default=False, action='store_true', help='check if trigger exists, restart dhcpd and exit')
+
+# Generate host lists only with hosts that have errors (currently only bad MAC
+# addresses are considered as errors)
+arg_parser.add_argument('-z','--errors', default=False, action='store_true', help='include only hosts with errors')
+
+# Display version
+arg_parser.add_argument('-v','--version', action='version', version='%(prog)s ' + script_version)
+
+# Define scope - sections or subnets to use to generate host lists. Without
+# specified section or subnet, script will list sections or subnets available
+scope = arg_parser.add_argument_group('Scope', 'list available sections and subnets or filter by section(s) or subnet(s)')
+scope.add_argument('-e','--sections', type=int, nargs='*', metavar='SECTION')
+scope.add_argument('-u','--subnets', type=int, nargs='*', metavar='SUBNET')
+
+# Define host state to include in create host lists (active, reserved, offline or dhcp)
+state = arg_parser.add_argument_group('State','what host state to include in output')
+state.add_argument('-R','--reserved', dest='states', action='append_const', const=4, help='reserved hosts')
+state.add_argument('-O','--offline', dest='states', action='append_const', const=3, help='offline hosts')
+state.add_argument('-D','--dhcp', dest='states', action='append_const', const=2, help='dhcp ranges and dynamic hosts')
+state.add_argument('-U','--used', dest='states', action='append_const', const=1, help='active hosts (default)')
+# Parse arguments
+args = arg_parser.parse_args()
+if args.states is None:
+  args.states = []
+
+
+# Load and parse specified configuration file
+config = ConfigParser.SafeConfigParser()
+config.read(args.config.name)
+
+if config.has_section(args.group):
+
+  if args.output is None and config.has_option(args.group,'output'):
+    args.output = config.get(args.group,'output')
+
+  if args.restart is False and config.has_option(args.group,'restart'):
+    args.restart = config.getboolean(args.group,'restart')
+
+  if args.restart_command is '/etc/init.d/isc-dhcp-server restart' and config.has_option(args.group,'restart-command'):
+    args.restart_command = config.get(args.group,'restart-command')
+
+  if args.restart_trigger is False and config.has_option(args.group,'restart-trigger'):
+    args.restart_trigger = config.getboolean(args.group,'restart-trigger')
+
+  if args.trigger is None and config.has_option(args.group,'trigger'):
+    args.trigger = config.get(args.group,'trigger')
+
+  if args.sections is None and config.has_option(args.group,'sections'):
+    args.sections = config.get(args.group,'sections').split(' ')
+
+  if args.subnets is None and config.has_option(args.group,'subnets'):
+    args.subnets = config.get(args.group,'subnets').split(' ')
+
+  if config.has_option(args.group,'used'):
+    if config.getboolean(args.group,'used'):
+      args.states.append(1)
+    else:
+      args.states = [x for x in args.states if x != 1]
+
+  if config.has_option(args.group,'dhcp'):
+    if config.getboolean(args.group,'dhcp'):
+      args.states.append(2)
+    else:
+      args.states = [x for x in args.states if x != 2]
+
+  if config.has_option(args.group,'offline'):
+    if config.getboolean(args.group,'offline'):
+      args.states.append(3)
+    else:
+      args.states = [x for x in args.states if x != 3]
+
+  if config.has_option(args.group,'reserved'):
+    if config.getboolean(args.group,'reserved'):
+      args.states.append(4)
+    else:
+      args.states = [x for x in args.states if x != 4]
+
+
+# If no host state was specified on the command line or in the configuration
+# file, default to active hosts only.
+if args.states is None or not args.states:
+  args.states = [1]
+
+
+# Convert IP address from its numerical value stored in the database.
+def ipAddr(s):
+  try:
+      return socket.inet_ntop(socket.AF_INET, struct.pack('!L', int(s)) )
+  except struct.error: pass
+  try:
+      return socket.inet_ntop(socket.AF_INET6, struct.pack('!QQ', int(s) >> 64, int(s) & 18446744073709551615 ) )
+  except struct.error: pass
+  except socket.error: pass
+  raise ValueError(s)
+
+# Check if ipv6.
+def isIpv6(s):
+  return "." not in s
+
+def reverse_pointer6(s):
+    """
+    Return the reverse DNS pointer name for the IPv6 address.
+    taken from http://hg.python.org/cpython/file/default/Lib/ipaddress.py
+    """
+    ip_int = IPV6_to_int(s)
+    hex_str = '%032x' % ip_int
+    parts = [hex_str[x:x+4] for x in range(0, 32, 4)]
+    exploded = ':'.join(parts)
+    reverse_chars = exploded[::-1].replace(':', '')
+    return '.'.join(reverse_chars) + '.ip6.arpa'
+
+def reverse_pointer(s):
+    """
+    Return the reverse DNS pointer name for the IPv6 address.
+    taken from http://hg.python.org/cpython/file/default/Lib/ipaddress.py
+    """
+    reverse_octets = str(s).split('.')[::-1]
+    return '.'.join(reverse_octets) + '.in-addr.arpa'
+
+def IPV6_to_int(ipv6_addr):
+    return int(hexlify(socket.inet_pton(socket.AF_INET6, ipv6_addr)), 16)
+
+# If no section has been specified, list all sections available.
+def listSections():
+  query = 'SELECT id, name, description FROM sections ORDER BY id ASC'
+
+  try:
+    db = MySQLdb.connect(read_default_file = args.config.name, read_default_group = 'mysql')
+
+    cursor = db.cursor()
+    cursor.execute(query)
+
+    rows = cursor.fetchall()
+
+    if rows:
+      output = '{}:\n'.format('Available sections')
+      for row in rows:
+        line = '{:>4}  |  {:<20} | {:<}\n'.format(row[0], row[1], row[2])
+        output = output + line
+
+      output  = output.rstrip('\n')
+      print output
+
+  except db.Error, e:
+    print "Error %d: %s" % (e.args[0],e.args[1])
+    sys.exit(1)
+
+  finally:
+    if db:
+      db.close()
+    if args.subnets is None or (args.subnets is None and args.sections is not None and not args.sections):
+      sys.exit(0)
+
+
+# If no subnet has been specified, list all subnets, optionally from specified
+# section.
+def listSubnets():
+  query = 'SELECT id,sectionId,subnet,mask,description FROM subnets '
+
+  if args.sections is not None and args.sections:
+    query = query + "WHERE sectionId IN (" + ','.join(map(str, args.sections)) + ") "
+
+  query = query + 'ORDER BY subnet ASC'
+  try:
+    db = MySQLdb.connect(read_default_file = args.config.name, read_default_group = 'mysql')
+    cursor = db.cursor()
+    cursor.execute(query)
+
+    rows = cursor.fetchall()
+
+    if rows:
+      output = '{}:\n'.format('Available subnets')
+      for row in rows:
+        subnetIp = ipAddr(row[2])
+        line = '{:>4}  |  {:<20} | {:<30}\n'.format(row[0], subnetIp + '/' + row[3], row[4])
+        output = output + line
+
+      output  = output.rstrip('\n')
+      print output
+
+  except db.Error, e:
+    print "Error %d: %s" % (e.args[0],e.args[1])
+    sys.exit(1)
+
+  finally:
+    if db:
+      db.close()
+    sys.exit(0)
+
+
+# ---- Main script starts here ----
+
+# If --restart-trigger is enabled, check if trigger file exists. If it does,
+# restart dhcpd using specified shell command and remove trigger. Exit regardless
+# of the trigger status.
+if args.restart_trigger:
+  if args.trigger is not None:
+    if os.path.isfile(os.path.realpath(args.trigger)):
+      os.system(args.restart_command)
+      os.remove(os.path.realpath(args.trigger))
+  sys.exit(0)
+
+# If --sections has been enabled without specifying any section, list available
+# sections.
+if args.sections is not None and not args.sections:
+  listSections()
+
+# If --subnets has been enabled without specifying any subnets, list available
+# subnets.
+if args.subnets is not None and not args.subnets:
+  listSubnets()
+
+
+# ---- Host list / host file generation ----
+
+query = "SELECT dns_name, mac, ip_addr, state FROM ipaddresses WHERE "
+
+# Filter query by section.
+if args.sections is not None and args.sections:
+  query = query + "subnetId IN (SELECT id FROM subnets WHERE sectionId IN (" + ','.join(map(str, args.sections)) + ")) AND "
+
+# Filter query by subnet.
+if args.subnets is not None and args.subnets:
+  query = query + "subnetId IN (" + ','.join(map(str, args.subnets)) + ") AND "
+
+# Filter query by host state.
+query = query + "state IN (" + ','.join(map(str, args.states)) + ") ORDER BY ip_addr ASC"
+
+try:
+
+  print 'Start to connect database!'
+
+
+  db = MySQLdb.connect(read_default_file = args.config.name, read_default_group = 'mysql')
+
+
+  cursor = db.cursor()
+  cursor.execute(query)
+
+  rows = cursor.fetchall()
+
+
+  # We have some hosts, yay!
+  if rows:
+    output = ''
+
+
+    output = output + '; Zone file built with phpipam-rev:\n\n'
+
+    for row in rows:
+
+      fqdn = row[0]
+      #hostname = fqdn.split('.')[0]
+      hostname = fqdn
+
+      ip = ipAddr(row[2])
+      ip_real = ip
+      isipv6 = isIpv6(ip_real)
+
+      state = row[3]
+
+      #entry = ''
+
+      # Check the hostname. If it's not specified, generate one.
+      if hostname:
+        host = hostname.replace(" ","");
+      else:
+        if state != '2':
+          host = args.prefix_dhcp + '-' + re.sub('\.', '-', ip)
+          fqdn = host.replace(" ","");
+        else:
+          host = args.prefix_dynamic + '-' + re.sub('\.', '-', ip)
+          fqdn = host.replace(" ","");
+
+
+      # After all tests, if we have valid host data, generate a host entry and
+      # add it to the output.
+
+
+      if args.errors == False or (args.errors == True and mac_error):
+
+        if isipv6:
+          reverse = reverse_pointer6(ip)
+        else:
+          reverse = reverse_pointer(ip)
+        entry = '{}    IN    PTR    {}\n'.format(reverse, fqdn)
+        output = output + entry
+
+
+    # Add the vim modeline at the end of the generated config file
+    output = output + '# vim:ft=named\n\n'
+
+
+    # Remove \n from end of the output.
+    output = output.rstrip('\n')
+
+    # If no output file is specified, or stdout is specified, print the output
+    # to stdout.
+    if args.output is None or args.output == '-':
+      print output
+
+    # Otherwise, write the output to a specified file.
+    else:
+
+      # If previous file already exists, write output to a temporary file
+      # instead and compare the two. If they are the same, remove the temporary
+      # file. If they are different, replace the old file with the new one.
+      if os.path.isfile(os.path.realpath(args.output)):
+        try:
+          output_file = open(os.path.realpath(args.output + '.tmp'),'w')
+          output_file.write(output)
+          output_file.close()
+          if filecmp.cmp(os.path.realpath(args.output),os.path.realpath(args.output + '.tmp')):
+            os.remove(os.path.realpath(args.output + '.tmp'))
+          else:
+            os.rename(os.path.realpath(args.output + '.tmp'),os.path.realpath(args.output))
+
+            # If --trigger is enabled, and host list has been changed, create
+            # a trigger file.
+            if args.trigger:
+              try:
+                open(os.path.realpath(args.trigger),'w').close()
+              except:
+                print "Error: cannot write to %s: access denied" % args.trigger
+                sys.exit(1)
+
+            # If --restart is enabled and host list has been changed, restart
+            # dhcpd daemon.
+            if args.restart:
+              os.system(args.restart_command)
+
+        except:
+          print "Error: cannot write to %s: access denied" % args.output + '.tmp'
+          sys.exit(1)
+
+      # There is no previous host list, so let's create a new one right away
+      # without a temporary file.
+      else:
+        try:
+          output_file = open(os.path.realpath(args.output),'w')
+          output_file.write(output)
+          output_file.close()
+
+          # If --trigger is enabled, and host list has been changed, create
+          # a trigger file.
+          if args.trigger:
+            try:
+              open(os.path.realpath(args.trigger),'w').close()
+            except:
+              print "Error: cannot write to %s: access denied" % args.trigger
+              sys.exit(1)
+
+          # If --restart is enabled and host list has been changed, restart
+          # dhcpd daemon.
+          if args.restart:
+            os.system(args.restart_command)
+
+        except:
+          print "Error: cannot write to %s: access denied" % args.output
+          sys.exit(1)
+
+  # There is no output
+  else:
+
+    # Create empty file by default, unless user disabled it
+    if args.no_empty and (args.output is not None and args.output != '-'):
+      if not os.path.isfile(os.path.realpath(args.output)):
+        open(os.path.realpath(args.output),'w').close()
+
+except db.Error, e:
+  print "Error %d: %s" % (e.args[0],e.args[1])
+  sys.exit(1)
+
+finally:
+  try:
+    if db:
+      db.close()
+  except NameError:
+    sys.exit(0)
